@@ -1,0 +1,25 @@
+# VLESS/REALITY detection rules for OpenGFW
+#
+# vless.yes = true when passive heuristics score >= 50
+# vless.score = 0-100 confidence score
+# vless.sni = the SNI from the ClientHello
+
+# Rule 1: Block high-confidence VLESS traffic to known target SNIs
+- name: "block vless known targets"
+  action: block
+  expr: vless.yes && (tls.req.sni contains "microsoft.com" || tls.req.sni contains "apple.com" || tls.req.sni contains "icloud.com" || tls.req.sni contains "amazon.com" || tls.req.sni contains "github.com")
+
+# Rule 2: Log medium-confidence VLESS (score >= 60 but not blocking)
+- name: "log suspicious vless"
+  action: allow
+  expr: vless.score >= 60 && vless.score < 100
+
+# Rule 3: Block VLESS on non-standard ports (very strong signal)
+- name: "block vless non-443"
+  action: block
+  expr: vless.yes && port.dst != 443
+
+# Rule 4: Combined with GeoIP - cert/SNI country mismatch
+- name: "block vless geo mismatch"
+  action: block
+  expr: vless.yes && tls.req.sni contains "microsoft.com" && !geoip(ip.dst, "US")
