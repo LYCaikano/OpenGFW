@@ -96,6 +96,11 @@ func (s *vlessStream) Feed(rev, start, end bool, skip int, data []byte) (u *anal
 	s.totalBytes += int64(len(data))
 
 	if !rev && !s.reqDone {
+		// Capture ClientHello bytes before LSM consumes them
+		if len(s.clientHello) == 0 && len(data) > 0 && data[0] == 0x16 {
+			s.clientHello = make([]byte, len(data))
+			copy(s.clientHello, data)
+		}
 		s.reqBuf.Append(data)
 		cancelled, _ := s.reqLSM.Run()
 		if cancelled {
@@ -202,19 +207,6 @@ func (s *vlessStream) preprocessClientHello() utils.LSMAction {
 	hsLen := int(header[6])<<16 | int(header[7])<<8 | int(header[8])
 	if hsLen < minDataSize {
 		return utils.LSMActionCancel
-	}
-
-	// Capture the full TLS record for active probing
-	// Record: type(1) + version(2) + length(2) + handshake data
-	recLen := 5 + hsLen
-	s.clientHello = make([]byte, recLen)
-	copy(s.clientHello, header)
-	// Copy remaining handshake data that hasn't been consumed yet
-	remaining := s.reqBuf.Buf
-	if len(remaining) < hsLen {
-		// Not all data available yet — will capture after parseClientHello
-		// Store header for now, rest will be appended
-		s.clientHello = append(s.clientHello[:5], remaining...)
 	}
 
 	s.reqBuf.Buf = append([]byte{byte(hsLen >> 16), byte(hsLen >> 8), byte(hsLen)}, s.reqBuf.Buf...)
