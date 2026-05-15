@@ -1,25 +1,50 @@
 # VLESS/REALITY detection rules for OpenGFW
 #
-# vless.yes = true when passive heuristics score >= 50
-# vless.score = 0-100 confidence score
-# vless.sni = the SNI from the ClientHello
+# Available vless properties:
+#   vless.yes    (bool)   — heuristic score >= 50
+#   vless.score  (int)    — 0-100 confidence
+#   vless.sni    (string) — ClientHello SNI (empty if not found)
+#   vless.alpn   ([]string) — negotiated ALPN protocols
+#   vless.probes (int)    — reserved for active probing
 
-# Rule 1: Block high-confidence VLESS traffic to known target SNIs
-- name: "block vless known targets"
+# Block all detected VLESS traffic
+- name: "block vless all"
   action: block
-  expr: vless.yes && (tls.req.sni contains "microsoft.com" || tls.req.sni contains "apple.com" || tls.req.sni contains "icloud.com" || tls.req.sni contains "amazon.com" || tls.req.sni contains "github.com")
+  expr: vless.yes
 
-# Rule 2: Log medium-confidence VLESS (score >= 60 but not blocking)
-- name: "log suspicious vless"
-  action: allow
-  expr: vless.score >= 60 && vless.score < 100
+# Block high-confidence VLESS (score >= 75 out of 100)
+- name: "block vless high"
+  action: block
+  expr: vless.score >= 75
 
-# Rule 3: Block VLESS on non-standard ports (very strong signal)
+# Block VLESS on non-standard ports (very strong signal)
 - name: "block vless non-443"
   action: block
   expr: vless.yes && port.dst != 443
 
-# Rule 4: Combined with GeoIP - cert/SNI country mismatch
+# Block VLESS with known proxy SNI targets
+- name: "block vless proxy snis"
+  action: block
+  expr: >-
+    vless.yes && (
+      vless.sni contains "microsoft.com" ||
+      vless.sni contains "apple.com" ||
+      vless.sni contains "icloud.com" ||
+      vless.sni contains "amazon.com" ||
+      vless.sni contains "github.com" ||
+      vless.sni contains "cloudfront.net"
+    )
+
+# GeoIP + SNI mismatch (VLESS with US company SNI but non-US server)
 - name: "block vless geo mismatch"
   action: block
-  expr: vless.yes && tls.req.sni contains "microsoft.com" && !geoip(ip.dst, "US")
+  expr: >-
+    vless.yes &&
+    (vless.sni contains "microsoft.com" ||
+     vless.sni contains "apple.com") &&
+    !geoip(ip.dst, "US")
+
+# Passive Trojan detection
+- name: "block trojan"
+  action: block
+  expr: trojan.yes

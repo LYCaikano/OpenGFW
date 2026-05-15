@@ -9,17 +9,23 @@ var _ analyzer.TCPAnalyzer = (*VLESSAnalyzer)(nil)
 
 // VLESSAnalyzer detects VLESS/REALITY traffic using passive heuristics.
 //
-// Detection approach:
+// Detection is based on two phases:
 //
-//	Phase 1: Extract TLS ClientHello features (SNI, ALPN, GREASE versions, cipher suites)
-//	         Score the ClientHello on how "Chrome-like" it is. VLESS/REALITY always
-//	         uses a Chrome fingerprint.
-//	Phase 2: Count alternating data segment sizes after the TLS handshake.
-//	         VLESS traffic has characteristic post-handshake size patterns:
-//	         small auth record (~100-500B) → server response (~200-8000B) →
-//	         small follow-up → server follow-up.
+//	Phase 1: TLS ClientHello fingerprinting — VLESS/REALITY always uses
+//	         a Chrome-like ClientHello (ALPN=h2+http/1.1, GREASE versions,
+//	         specific cipher suites, 32-byte session ID).
+//	Phase 2: Post-handshake data segment size pattern — after TLS handshake,
+//	         VLESS traffic has characteristic alternating record sizes
+//	         (small C→S auth, larger S→C response).
 //
-// The analyzer produces: vless.yes (bool), vless.score (int 0-100), vless.sni (string)
+// Exposed properties for rule expressions:
+//
+//	vless.yes    (bool)   — heuristic score >= threshold (default 50)
+//	vless.score  (int)    — confidence 0-100
+//	vless.sni    (string) — SNI from ClientHello
+//	vless.alpn   ([]string) — ALPN protocols
+//	vless.grease (bool)   — has GREASE versions
+//	vless.probes (int)    — matching probe count (reserved for active probing integration)
 type VLESSAnalyzer struct{}
 
 func (a *VLESSAnalyzer) Name() string {
@@ -46,13 +52,13 @@ type vlessStream struct {
 	respLSM  *utils.LinearStateMachine
 	respDone bool
 
-	// Post-handshake data segment counting (like TrojanAnalyzer)
+	sni  string
+	alpn []string
+
 	counting bool
 	rev      bool
 	seq      [4]int
 	seqIndex int
-
-	sni string
 }
 
 func newVLESSStream(logger analyzer.Logger) *vlessStream {
@@ -97,13 +103,8 @@ func (s *vlessStream) Feed(rev, start, end bool, skip int, data []byte) (u *anal
 		return nil, false
 	}
 
-	// Phase 2: after both ClientHello and ServerHello seen,
-	// count alternating data segment sizes
 	if s.reqDone && s.respDone {
 		if !s.counting {
-			// Start counting when we see the first post-handshake data from client
-			// In TLS 1.3 flow: after ServerHello, client sends CCS(6 bytes) + Finished(encrypted)
-			// The CCS is: 14 03 03 00 01 01
 			if !rev && len(data) >= 6 &&
 				data[0] == 0x14 && data[1] == 0x03 && data[2] == 0x03 &&
 				data[3] == 0x00 && data[4] == 0x01 && data[5] == 0x01 {
@@ -117,15 +118,21 @@ func (s *vlessStream) Feed(rev, start, end bool, skip int, data []byte) (u *anal
 		} else {
 			s.seqIndex++
 			if s.seqIndex == 4 {
-				// 4 alternating segments collected → final classification
 				score := s.computeScore()
+				props := analyzer.PropMap{
+					"yes":    score >= 50,
+					"score":  score,
+					"probes": 0,
+				}
+				if s.sni != "" {
+					props["sni"] = s.sni
+				}
+				if len(s.alpn) > 0 {
+					props["alpn"] = s.alpn
+				}
 				return &analyzer.PropUpdate{
 					Type: analyzer.PropUpdateMerge,
-					M: analyzer.PropMap{
-						"yes":   score >= 50,
-						"score": score,
-						"sni":   s.sni,
-					},
+					M:    props,
 				}, true
 			}
 			s.seq[s.seqIndex] += len(data)
@@ -140,7 +147,6 @@ func (s *vlessStream) Close(limited bool) *analyzer.PropUpdate {
 	return nil
 }
 
-// computeScore combines ClientHello fingerprint score with data segment patterns.
 func (s *vlessStream) computeScore() int {
 	score := s.reqScore
 
@@ -149,8 +155,6 @@ func (s *vlessStream) computeScore() int {
 	c2s2 := s.seq[2]
 	s2c2 := s.seq[3]
 
-	// VLESS post-handshake pattern:
-	// small C→S auth record, then larger S→C response
 	if c2s1 > 50 && c2s1 < 800 && s2c1 > 200 && s2c1 < 16000 {
 		score += 10
 	}
@@ -182,43 +186,34 @@ func (s *vlessStream) preprocessClientHello() utils.LSMAction {
 		return utils.LSMActionCancel
 	}
 
-	// Store hsLen for next step
 	s.reqBuf.Buf = append([]byte{byte(hsLen >> 16), byte(hsLen >> 8), byte(hsLen)}, s.reqBuf.Buf...)
 	return utils.LSMActionNext
 }
 
 func (s *vlessStream) parseClientHello() utils.LSMAction {
-	// Read the hsLen we prepended
 	hsLen := int(s.reqBuf.Buf[0])<<16 | int(s.reqBuf.Buf[1])<<8 | int(s.reqBuf.Buf[2])
 	s.reqBuf.Skip(3)
 
-	// Get the full ClientHello body as a sub-buffer
 	chBuf, ok := s.reqBuf.GetSubBuffer(hsLen, true)
 	if !ok {
 		return utils.LSMActionPause
 	}
 
-	// Parse ClientHello fields
 	score := 0
-	_ = score
 
-	// Legacy version (2 bytes)
-	chBuf.GetUint16(false, true)
+	chBuf.GetUint16(false, true) // legacy version
 
-	// Random (32 bytes)
 	random, ok := chBuf.Get(32, true)
 	if !ok {
 		return utils.LSMActionCancel
 	}
 
-	// Session ID
 	sessLen, ok := chBuf.GetByte(true)
 	if !ok {
 		return utils.LSMActionCancel
 	}
 	chBuf.Skip(int(sessLen))
 
-	// Cipher suites
 	cipherLen, ok := chBuf.GetUint16(false, true)
 	if !ok || cipherLen%2 != 0 {
 		return utils.LSMActionCancel
@@ -231,17 +226,14 @@ func (s *vlessStream) parseClientHello() utils.LSMAction {
 		}
 	}
 
-	// Compression methods
 	compLen, ok := chBuf.GetByte(true)
 	if !ok {
 		return utils.LSMActionCancel
 	}
 	chBuf.Skip(int(compLen))
 
-	// Extensions
 	extsLen, ok := chBuf.GetUint16(false, true)
 	if !ok {
-		// No extensions, score as-is
 		s.reqScore = score
 		s.reqDone = true
 		return utils.LSMActionNext
@@ -252,10 +244,8 @@ func (s *vlessStream) parseClientHello() utils.LSMAction {
 		return utils.LSMActionCancel
 	}
 
-	// Parse extensions for scoring
 	hasH2, hasHTTP1 := false, false
 	hasGREASE := false
-	hasECH := false
 
 	for extBuf.Len() > 0 {
 		extType, ok := extBuf.GetUint16(false, true)
@@ -272,40 +262,37 @@ func (s *vlessStream) parseClientHello() utils.LSMAction {
 		}
 
 		switch extType {
-		case 0x0000: // SNI
+		case 0x0000: // SNI — extracted for rule matching, NOT hardcoded scoring
 			extData.Skip(2)
 			sniType, _ := extData.GetByte(true)
 			if sniType == 0 {
 				sniLen, _ := extData.GetUint16(false, true)
-				sni, ok := extData.GetString(int(sniLen), true)
+				sniStr, ok := extData.GetString(int(sniLen), true)
 				if ok {
-					s.sni = sni
-					// Known VLESS target SNIs
-					switch sni {
-					case "aws.amazon.com", "www.amazon.com", "www.apple.com",
-						"www.icloud.com", "www.microsoft.com", "docs.github.com":
-						score += 25
-					}
+					s.sni = sniStr
 				}
 			}
 		case 0x0010: // ALPN
 			extData.Skip(2)
+			var alpns []string
 			for extData.Len() > 0 {
 				alpnLen, ok := extData.GetByte(true)
 				if !ok {
 					break
 				}
-				alpn, ok := extData.GetString(int(alpnLen), true)
+				alpnStr, ok := extData.GetString(int(alpnLen), true)
 				if !ok {
 					break
 				}
-				if alpn == "h2" {
+				alpns = append(alpns, alpnStr)
+				if alpnStr == "h2" {
 					hasH2 = true
 				}
-				if alpn == "http/1.1" {
+				if alpnStr == "http/1.1" {
 					hasHTTP1 = true
 				}
 			}
+			s.alpn = alpns
 		case 0x002b: // supported_versions
 			verListLen, _ := extData.GetByte(true)
 			for i := 0; i < int(verListLen)/2 && extData.Len() >= 2; i++ {
@@ -314,25 +301,23 @@ func (s *vlessStream) parseClientHello() utils.LSMAction {
 					hasGREASE = true
 				}
 			}
-		case 0xfe0d: // ECH
-			hasECH = true
 		}
 	}
 
-	// Scoring based on extracted features
+	// Scoring based on TLS fingerprint features (SNI-independent)
 	if hasH2 && hasHTTP1 {
-		score += 20 // VLESS ALPN matches Chrome
+		score += 20
 	}
 	if hasGREASE {
-		score += 10 // Chrome GREASE
+		score += 15
 	}
 	if int(sessLen) == 32 {
-		score += 10 // TLS 1.3 middlebox compat session ID
+		score += 10
 	}
 	if len(ciphers) >= 12 && len(ciphers) <= 20 {
-		score += 10 // Chrome-like cipher count
+		score += 10
 	}
-	// Chrome cipher suites: always includes 0x1301, 0x1302, 0x1303
+
 	has1301, has1302, has1303 := false, false, false
 	for _, c := range ciphers {
 		if c == 0x1301 {
@@ -352,19 +337,15 @@ func (s *vlessStream) parseClientHello() utils.LSMAction {
 		score += 5
 	}
 
-	// Entropy check on random bytes (REALITY embeds auth there)
 	if len(random) > 0 {
 		seen := make(map[byte]bool)
 		for _, b := range random {
 			seen[b] = true
 		}
-		entropy := float64(len(seen)) / float64(len(random))
-		if entropy > 0.7 {
-			score += 5 // high entropy = looks like random → could be REALITY auth
+		if float64(len(seen))/float64(len(random)) > 0.7 {
+			score += 5
 		}
 	}
-
-	_ = hasECH
 
 	s.reqScore = score
 	s.reqDone = true
