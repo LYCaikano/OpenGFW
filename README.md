@@ -112,9 +112,15 @@ workers: 4  # 建议设为 CPU 核心数
 
 ### 完整 VLESS 检测体系
 
-OpenGFW 的被动分析器适合作为**低开销初筛层**。对于需要确定性检测的场景，
-可配合 `vless-cracker-v1`（C 语言主动探测 PoC，支持双栈指纹对比，假阳性率 0%）
-作为**主动确认层**。两者结合可实现高效+精准的 VLESS/REALITY 检测体系。
+OpenGFW 内建完整的两层 VLESS/REALITY 检测：
+
+1. **被动初筛** (`analyzer/tcp/vless.go`): TLS 指纹打分，零开销全流量覆盖
+2. **主动确认** (`collector/prober.go`): 当某 IP 的 VLESS 比例 >20% 时自动触发：
+   - 从已捕获的连接中提取真实 ClientHello 字节
+   - 重放至目标服务器（Round A: 原 Session ID → VLESS 栈; Round B: 随机 Session ID → fallback 栈）
+   - 发送 14 组 CCS + Alert 畸形探针，并发比对双栈指纹
+   - 3 轮确认，假阳性率 0%
+3. **自动发现** (`collector/state.go`): 自动采集高频 SNI，无需维护目标列表
 
 ## 使用场景
 

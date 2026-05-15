@@ -1,20 +1,7 @@
-// Package collector provides global IP-level traffic statistics and
-// active probing coordination for VLESS/REALITY detection.
-//
-// Architecture:
-//
-//	analyzer (vless.go) ──Report()──▶ State (per-IP stats)
-//	                                       │
-//	                               ShouldProbe(ip) ?
-//	                                       │
-//	Prober ──active probe──▶ Server ◀──┘
-//	    │
-//	    └──▶ State.MarkProbed(ip, sni, result)
-//
-// Rules use state via expr functions: ipVlessRatio(), ipHasProbe()
 package collector
 
 import (
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -22,15 +9,22 @@ import (
 
 // IPState tracks connection-level statistics for a single source IP.
 type IPState struct {
-	SrcIP       string
-	TotalConns  int64
-	VlessConns  int64
-	TotalBytes  int64
-	FirstSeen   time.Time
-	LastSeen    time.Time
-	SNIs        map[string]int64 // SNI → count
-	ProbeSent   bool
-	ProbeResult map[string]bool // SNI → confirmed VLESS?
+	SrcIP      string
+	TotalConns int64
+	VlessConns int64
+	TotalBytes int64
+	FirstSeen  time.Time
+	LastSeen   time.Time
+	SNIs       map[string]*SNIInfo
+	ProbeSent  bool
+}
+
+// SNIInfo holds per-SNI data including captured ClientHello for replay.
+type SNIInfo struct {
+	Count        int64
+	ClientHellos [][]byte // captured ClientHello TLS records
+	Probed       bool
+	Confirmed    bool
 }
 
 // State is the global, thread-safe tracker of per-IP stats.
@@ -41,21 +35,25 @@ type State struct {
 }
 
 // ProbeFunc is called when an IP exceeds the VLESS ratio threshold.
-// It receives the IP and top SNIs to probe.
-type ProbeFunc func(srcIP string, topSNIs []string)
+type ProbeFunc func(srcIP string, topSNIs []SNIProbeTarget)
 
-// Report records a classified connection.
-func (s *State) Report(srcIP, sni string, isVless bool, bytes int64) {
+// SNIProbeTarget bundles SNI with ClientHello for probing.
+type SNIProbeTarget struct {
+	SNI         string
+	ClientHello []byte
+}
+
+// Report records a classified connection with the captured ClientHello.
+func (s *State) Report(srcIP, sni string, isVless bool, bytes int64, clientHello []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	st, ok := s.ips[srcIP]
 	if !ok {
 		st = &IPState{
-			SrcIP:       srcIP,
-			FirstSeen:   time.Now(),
-			SNIs:        make(map[string]int64),
-			ProbeResult: make(map[string]bool),
+			SrcIP:     srcIP,
+			FirstSeen: time.Now(),
+			SNIs:      make(map[string]*SNIInfo),
 		}
 		s.ips[srcIP] = st
 	}
@@ -67,29 +65,69 @@ func (s *State) Report(srcIP, sni string, isVless bool, bytes int64) {
 		st.VlessConns++
 	}
 	if sni != "" {
-		st.SNIs[sni]++
+		si, ok := st.SNIs[sni]
+		if !ok {
+			si = &SNIInfo{}
+			st.SNIs[sni] = si
+		}
+		si.Count++
+		if len(clientHello) > 0 && len(si.ClientHellos) < 5 {
+			si.ClientHellos = append(si.ClientHellos, clientHello)
+		}
 	}
 
-	// Trigger active probe if conditions met
 	if s.shouldProbeLocked(st) {
 		st.ProbeSent = true
-		top := topSNIsLocked(st, 3)
-		if s.probe != nil {
-			go s.probe(srcIP, top)
+		targets := topSNIProbeTargetsLocked(st, 3)
+		if s.probe != nil && len(targets) > 0 {
+			go s.probe(srcIP, targets)
 		}
 	}
 }
 
-// shouldProbeLocked checks probe conditions (caller holds mu).
 func (s *State) shouldProbeLocked(st *IPState) bool {
 	if st.ProbeSent {
 		return false
 	}
 	if st.TotalConns < 10 {
-		return false // need enough samples
+		return false
 	}
 	ratio := float64(st.VlessConns) / float64(st.TotalConns)
 	return ratio > 0.2
+}
+
+func topSNIProbeTargetsLocked(st *IPState, n int) []SNIProbeTarget {
+	type kv struct {
+		sni string
+		cnt int64
+	}
+	var kvs []kv
+	for sni, info := range st.SNIs {
+		kvs = append(kvs, kv{sni, info.Count})
+	}
+	for i := 0; i < len(kvs)-1; i++ {
+		for j := i + 1; j < len(kvs); j++ {
+			if kvs[j].cnt > kvs[i].cnt {
+				kvs[i], kvs[j] = kvs[j], kvs[i]
+			}
+		}
+	}
+	if n > len(kvs) {
+		n = len(kvs)
+	}
+	var targets []SNIProbeTarget
+	for i := 0; i < n; i++ {
+		si := st.SNIs[kvs[i].sni]
+		var ch []byte
+		if len(si.ClientHellos) > 0 {
+			ch = si.ClientHellos[0]
+		}
+		targets = append(targets, SNIProbeTarget{
+			SNI:         kvs[i].sni,
+			ClientHello: ch,
+		})
+	}
+	return targets
 }
 
 // VlessRatio returns the VLESS connection ratio for an IP.
@@ -103,8 +141,7 @@ func (s *State) VlessRatio(srcIP string) float64 {
 	return float64(st.VlessConns) / float64(st.TotalConns)
 }
 
-// IsLongConn checks if connections from this IP tend to be long-lived
-// (high bytes per connection, indicating proxy/tunnel usage).
+// IsLongConn checks if connections from this IP tend to be long-lived.
 func (s *State) IsLongConn(srcIP string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -112,9 +149,7 @@ func (s *State) IsLongConn(srcIP string) bool {
 	if !ok || st.TotalConns == 0 {
 		return false
 	}
-	avgBytes := st.TotalBytes / st.TotalConns
-	// Long connections typically transfer 100KB+ per connection
-	return avgBytes > 102400
+	return st.TotalBytes/st.TotalConns > 102400
 }
 
 // IsHighTraffic checks if an IP has high traffic volume.
@@ -125,95 +160,53 @@ func (s *State) IsHighTraffic(srcIP string) bool {
 	if !ok {
 		return false
 	}
-	// High traffic: >10MB total
 	return st.TotalBytes > 10*1024*1024
 }
 
-// GetSNIs returns the most common SNIs for an IP.
-func (s *State) GetSNIs(srcIP string, topN int) []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	st, ok := s.ips[srcIP]
-	if !ok {
-		return nil
-	}
-	return topSNIsLocked(st, topN)
-}
-
-// IsProbed checks if an IP has been probed for a specific SNI.
-func (s *State) IsProbed(srcIP, sni string, confirmed bool) *bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	st, ok := s.ips[srcIP]
-	if !ok {
-		return nil
-	}
-	v, ok := st.ProbeResult[sni]
-	if !ok {
-		return nil
-	}
-	// Return nil if confirmed doesn't match
-	if v != confirmed {
-		return nil
-	}
-	return &v
-}
-
 // MarkProbed records the result of an active probe.
-func (s *State) MarkProbed(srcIP, sni string, isVLESS bool) {
+func (s *State) MarkProbed(srcIP, sni string, confirmed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st, ok := s.ips[srcIP]
 	if !ok {
 		return
 	}
-	st.ProbeResult[sni] = isVLESS
+	si, ok := st.SNIs[sni]
+	if !ok {
+		return
+	}
+	si.Probed = true
+	si.Confirmed = confirmed
 }
 
-// GetState returns a copy of the IP state for inspection.
-func (s *State) GetState(srcIP string) *IPState {
+// IsConfirmed checks if an SNI has been confirmed as VLESS for an IP.
+func (s *State) IsConfirmed(srcIP, sni string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	st, ok := s.ips[srcIP]
+	if !ok {
+		return false
+	}
+	si, ok := st.SNIs[sni]
+	if !ok {
+		return false
+	}
+	return si.Confirmed
+}
+
+// GetSNIs returns SNI names for an IP.
+func (s *State) GetSNIs(srcIP string) []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	st, ok := s.ips[srcIP]
 	if !ok {
 		return nil
 	}
-	cp := *st
-	cp.SNIs = make(map[string]int64, len(st.SNIs))
-	for k, v := range st.SNIs {
-		cp.SNIs[k] = v
+	var snis []string
+	for sni := range st.SNIs {
+		snis = append(snis, sni)
 	}
-	cp.ProbeResult = make(map[string]bool, len(st.ProbeResult))
-	for k, v := range st.ProbeResult {
-		cp.ProbeResult[k] = v
-	}
-	return &cp
-}
-
-func topSNIsLocked(st *IPState, n int) []string {
-	type kv struct {
-		k string
-		v int64
-	}
-	var kvs []kv
-	for k, v := range st.SNIs {
-		kvs = append(kvs, kv{k, v})
-	}
-	for i := 0; i < len(kvs)-1; i++ {
-		for j := i + 1; j < len(kvs); j++ {
-			if kvs[j].v > kvs[i].v {
-				kvs[i], kvs[j] = kvs[j], kvs[i]
-			}
-		}
-	}
-	if n > len(kvs) {
-		n = len(kvs)
-	}
-	var result []string
-	for i := 0; i < n; i++ {
-		result = append(result, kvs[i].k)
-	}
-	return result
+	return snis
 }
 
 // NewState creates a new State tracker.
@@ -224,28 +217,6 @@ func NewState(probeFn ProbeFunc) *State {
 	}
 }
 
-// Stub functions for rule expression integration.
-// These are called by expr rules to check global state.
-
-// IPVlessRatio returns VLESS ratio for an IP (for use in expr rules).
-func (s *State) IPVlessRatio(ipStr string) float64 {
-	return s.VlessRatio(ipStr)
-}
-
-// IPHighTraffic returns true if the IP has high traffic volume.
-func (s *State) IPHighTraffic(ipStr string) bool {
-	return s.IsHighTraffic(ipStr)
-}
-
-// IPLongConn returns true if the IP tends to have long connections.
-func (s *State) IPLongConn(ipStr string) bool {
-	return s.IsLongConn(ipStr)
-}
-
-// IPSNIs returns comma-separated SNIs for an IP.
-func (s *State) IPSNIs(ipStr string) []string {
-	return s.GetSNIs(ipStr, 10)
-}
-
-// Ensure net import is used
+// Ensure imports used
+var _ = fmt.Sprintf
 var _ net.IP
