@@ -3,7 +3,11 @@ package tcp
 import (
 	"github.com/apernet/OpenGFW/analyzer"
 	"github.com/apernet/OpenGFW/analyzer/utils"
+	"github.com/apernet/OpenGFW/collector"
 )
+
+// Collector is set by cmd/root.go to enable global state tracking and active probing.
+var Collector *collector.State
 
 var _ analyzer.TCPAnalyzer = (*VLESSAnalyzer)(nil)
 
@@ -37,11 +41,13 @@ func (a *VLESSAnalyzer) Limit() int {
 }
 
 func (a *VLESSAnalyzer) NewTCP(info analyzer.TCPInfo, logger analyzer.Logger) analyzer.TCPStream {
-	return newVLESSStream(logger)
+	return newVLESSStream(logger, info.SrcIP.String())
 }
 
 type vlessStream struct {
 	logger analyzer.Logger
+
+	srcIP string
 
 	reqBuf   *utils.ByteBuffer
 	reqLSM   *utils.LinearStateMachine
@@ -55,14 +61,16 @@ type vlessStream struct {
 	sni  string
 	alpn []string
 
-	counting bool
-	rev      bool
-	seq      [4]int
-	seqIndex int
+	counting   bool
+	rev        bool
+	seq        [4]int
+	seqIndex   int
+	totalBytes int64
 }
 
-func newVLESSStream(logger analyzer.Logger) *vlessStream {
+func newVLESSStream(logger analyzer.Logger, srcIP string) *vlessStream {
 	s := &vlessStream{
+		srcIP:   srcIP,
 		logger:  logger,
 		reqBuf:  &utils.ByteBuffer{},
 		respBuf: &utils.ByteBuffer{},
@@ -84,6 +92,7 @@ func (s *vlessStream) Feed(rev, start, end bool, skip int, data []byte) (u *anal
 	if len(data) == 0 {
 		return nil, false
 	}
+	s.totalBytes += int64(len(data))
 
 	if !rev && !s.reqDone {
 		s.reqBuf.Append(data)
@@ -119,9 +128,17 @@ func (s *vlessStream) Feed(rev, start, end bool, skip int, data []byte) (u *anal
 			s.seqIndex++
 			if s.seqIndex == 4 {
 				score := s.computeScore()
+				isVless := score >= 50
+
+				// Report to global collector for IP-level tracking
+				if Collector != nil && s.srcIP != "" {
+					Collector.Report(s.srcIP, s.sni, isVless, s.totalBytes)
+				}
+
 				props := analyzer.PropMap{
-					"yes":    score >= 50,
+					"yes":    isVless,
 					"score":  score,
+					"bytes":  s.totalBytes,
 					"probes": 0,
 				}
 				if s.sni != "" {

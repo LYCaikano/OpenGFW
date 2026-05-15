@@ -11,6 +11,7 @@ import (
 	"github.com/apernet/OpenGFW/analyzer"
 	"github.com/apernet/OpenGFW/analyzer/tcp"
 	"github.com/apernet/OpenGFW/analyzer/udp"
+	"github.com/apernet/OpenGFW/collector"
 	"github.com/apernet/OpenGFW/engine"
 	"github.com/apernet/OpenGFW/io"
 	"github.com/apernet/OpenGFW/modifier"
@@ -266,6 +267,13 @@ func runMain(cmd *cobra.Command, args []string) {
 		logger.Fatal("failed to compile rules", zap.Error(err))
 	}
 	engineConfig.Ruleset = rs
+
+	// Collector & Active Prober (VLESS/REALITY)
+	prober := collector.NewProber(nil)
+	state := collector.NewState(prober.StartProbeCallback())
+	prober.SetState(state)
+	tcp.Collector = state
+	logger.Info("VLESS collector and active prober initialized")
 
 	// Engine
 	en, err := engine.NewEngine(*engineConfig)
